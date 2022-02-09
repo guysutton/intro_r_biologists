@@ -1,0 +1,173 @@
+---
+title: "Tutorial #11: Species community composition"
+author: "Guy F. Sutton"
+date: "Centre for Biological Control, Rhodes University"
+output: pdf_document
+---
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Load required packages
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse,
+               here,
+               DHARMa,
+               mvabund,
+               boral) 
+
+# Change ggplot theme
+# - This makes the graphs we will eventually make look pretty. 
+# - Don't worry about this for now. 
+theme_set(theme_classic() +
+            theme(panel.border = element_rect(colour = "black", 
+                                              fill = NA),
+                  axis.text = element_text(colour = "black"),
+                  axis.title.x = element_text(margin = unit(c(2, 0, 0, 0), 
+                                                            "mm")),
+                  axis.title.y = element_text(margin = unit(c(0, 4, 0, 0), 
+                                                            "mm")),
+                  legend.position = "none"))
+```
+
+# 11. Species community composition
+
+In the previous tutorials, we have been analysing a single response variable. However, it is very common for ecologists to collect species community composition data, whereby they record the abundance of multiple species occuring in a community. For example, recording the presence and abundance of the 10 insect species that occur on a plant species, or recording the abundance of ectoparasites (e.g. ticks) on different antelope species. While it is tempting to run a seperate GLM to each species, this would not be appropriate because the data points are not independent. Moreover, you often want to make inference about the community itself - e.g. does insect community composition change between seasons? Do different antelope species host different ectoparasite communities? 
+
+To do this, we can use a statistical test called a `multivariate GLM`. You may have heard of a test called Permutational ANOVA (*PERManova*) to compare community composition. Unfortunately, this test is used alot, but is usually not an appropriate fit to the data - it makes assumptions about the variance in the data that usually aren't met. 
+
+Below, we are going to work through a dataset that I collected during my PhD. The dataset contains the abundances of six insect species that I recorded on a grass species that I worked on. I collected these data from sites that I sampled in different seasons (`season`) and at sites that had been recently disturbed by mowing or left undisturbed (`disturb_allow_overwinter`). We wanted to know if species community composition differed between seasons and between disturbed versus undisturbed sites, and if so, which of the individual insect species explained any observed shifts in species community composition between seasons or disturbed versus undisturbed sites.
+
+# 11.1. Fit the global model - does community composition change? 
+
+To fit the `multivariate GLM`, we need to give `R` a species community composition matrix. This is basically just a survey x species matrix of abundances, where each row contains abundances from different surveys, and the columns contain the abundances for the different species. *Note that you cannot have a row total = 0 (i.e. the total abundance across all species = 0). The models will not work. You can simply just add a dummy species with abundance = 1, like I have done below so solve this (`sp_dum1`).*
+
+```{r echo = FALSE, warning = FALSE, message = FALSE}
+# Import data 
+raw_data <- readr::read_csv2(here::here("./data_raw/all_surveys_data.csv"))
+
+# Drop some columns that we don't need 
+raw_data <- raw_data %>%
+  dplyr::select(site:insect_abun_total, disturbance_type:disturb_allow_overwinter) %>%
+  # Keep plant records for only two target plants
+  dplyr::filter(plant_species == c("Sporobolus pyramidalis", "Sporobolus natalensis")) %>%
+  # Clean the disturbance variable
+  mutate(disturb_allow_overwinter = case_when(
+    disturb_allow_overwinter == "No" ~ "Disturbed",
+    disturb_allow_overwinter == "Yes" ~ "Undisturbed"))
+
+# Summarise site x sampling date abundance data
+com_data <- raw_data %>%
+  group_by(site_code, sampling_date) %>%
+  mutate(
+    sp_tet1 = sum(tetramesa_sp1_abun, na.rm = TRUE),
+    sp_tet2 = sum(tetramesa_sp2_abun, na.rm = TRUE),
+    sp_bru1 = sum(bruchophagus_sp1_abun, na.rm = TRUE),
+    sp_sht1 = sum(shotholeborer_sp1_abun, na.rm = TRUE),
+    sp_chl1 = sum(chloropid_sp1_abun, na.rm = TRUE),
+    sp_eur4 = sum(eurytomid_sp4_abun, na.rm = TRUE)) %>%
+  dplyr::select(site_code, sampling_date, season, 
+                survey_type, plant_species, 
+                disturbance_type:disturb_allow_overwinter, sp_tet1:sp_eur4) %>%
+  slice(1)
+
+# Keep only the LTS sites because of the differences in sampling effort 
+com_data_lts <- com_data %>%
+  dplyr::filter(survey_type == "LTS")
+
+# Now we need to extract only the columns with species abundance data
+com_data_sp <- com_data_lts %>%
+  group_by(site_code, sampling_date, season, disturb_allow_overwinter) %>%
+  dplyr::select(starts_with("sp_")) %>%
+  ungroup()
+
+# Store this data.frame so that we can extract factor names from it later with ease 
+org.data <- com_data_sp
+
+# Now keep only the species abundances columns 
+com_data_sp <- com_data_sp %>% 
+  dplyr::select(-c(site_code, sampling_date, season, disturb_allow_overwinter))
+
+# Because of issues where rows sum to 0, we must use 
+# zero-adjusted Bray-Curtis vals - add dummy species where abundance = 1
+com_data_sp$sp_dum1 <- 1
+
+# Make this into a matrix
+com_matrix <- as.matrix(com_data_sp)
+print(com_matrix)
+```
+
+To fit a `multivariate GLM`, we will be using the `manyglm` function from the `mvabund` package. Before we fit the model, we need to convert the community matrix into a data format that `mvabund` requires. 
+
+```{r}
+# Convert species community abundance matrix to 'mvabund' object
+insect.spp <- mvabund::mvabund(com_matrix)
+```
+
+#### Fit the model
+
+Much like the previous GLM's, we can specify the statistical distribution of the model and evaluate the fit of different statistical distributions. Below, we are going to fit a Poisson and then a negative binomial distribution to our data and see if either provide a good fit. 
+
+```{r}
+# Run global model with poisson distribution
+mod_p <- manyglm(insect.spp ~ 
+                  # Fixed effects - allow disturbance effect to vary with season
+                  com_data_lts$disturb_allow_overwinter * 
+                  com_data_lts$season, 
+                # Specify the distribution
+                family = "poisson")
+
+# Check model assumptions
+plot(mod_p)
+```
+
+Poisson does not appear to provide a good fit - the range in the residuals gets wider as x increases. This tells us that there is unequal variances - as abundances get higher, so does variance. 
+
+```{r}
+# Run global model with negative binomial distribution
+mod_nb <- manyglm(insect.spp ~ 
+                  # Fixed effects - allow disturbance effect to vary with season
+                  com_data_lts$disturb_allow_overwinter * 
+                  com_data_lts$season, 
+                # Specify the distribution
+                family="negative_binomial")
+
+# Check model assumptions
+plot(mod_nb)
+```
+
+The negative binomial looks to be a much better fit. The range of the residuals is pretty consistent across x. 
+
+#### Perform global hypothesis test 
+
+Here, we can test for statistical significance of `season` and `disturb_allow_overwinter`, and their interaction (does disturbance effect the insect community differently in summer vs winter). We again will use Likelihood Ratio Tests (LRT's) to test parameter significance. 
+
+```{r cache = TRUE}
+# Test multivariate global hypothesis tests
+anova(mod_nb, 
+      nBoot = 999, 
+      test = "LR")
+```
+
+Insect community composition was significantly different disturbed vs undisturbed sites as indicated by the significant p-value for `disturb_allow_overwinter` (X2 = 104.84, P < 0.001). Neither `season` nor the interaction between season and disturbance had a significant effect on insect community composition. 
+
+#### Perform univariate hypothesis test 
+
+Below, we can evaluate which of the individual insect species explain the shift in community composition between disturbed vs undisturbed sites. 
+
+```{r cache = TRUE}
+anova(mod_nb, 
+      nBoot = 999, 
+      p.uni = "adjusted")
+```
+
+We see that sp_tet1 (X2 = 18.51, P = 0.001), sp_tet2 (X2 = 42.44, P = 0.001), sp_bru1 (X2 = 35.16, P = 0.001) and sp_eur4 (X2 = 5.44, P = 0.042) were significantly contributors to the observed shift in community composition between disturbed vs undisturbed sites. I.e. The abundances of these species were significantly different between disturbed vs undisturbed sites. 
+
+
+
+
+
+
+
+
+
